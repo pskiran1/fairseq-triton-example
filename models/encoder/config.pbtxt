@@ -1,5 +1,6 @@
 name: "encoder"
-platform: "pytorch_libtorch"
+backend: "python"
+#platform: "pytorch_libtorch"
 max_batch_size: 16
 input [
   {
