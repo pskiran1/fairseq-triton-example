@@ -7,4 +7,7 @@
 6. Build the Docker image using the provided Dockerfile (`docker build .`)
 7. Run the built Docker image with the compiled models, the models directory should be mounted to `/mnt/models` in the container
 8. Run locust using `locust` CLI command and open the browser to `http://localhost:8089` to start the test
+
+        locust -f locustfile.py --headless -u 10 -r 5 --host=http://localhost:8000
+
 9. Run the test with host configured to the Tritonserver we ran, 15 peak concurrency, and 5 spawn rate
