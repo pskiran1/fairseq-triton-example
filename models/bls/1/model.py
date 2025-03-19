@@ -20,6 +20,21 @@ import triton_python_backend_utils as pb_utils
 import json
 from torch.utils.dlpack import from_dlpack, to_dlpack
 import numpy as np
+import random
+import os
+
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+torch.use_deterministic_algorithms(True)
+
+seed = 0
+torch.manual_seed(seed)
+random.seed(seed)
+np.random.seed(seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(seed)
+
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # or ":16:8"
 
 
 def get_torch_from_request(request, input_name: str) -> Tensor:

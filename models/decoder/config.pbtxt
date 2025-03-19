@@ -62,6 +62,16 @@ output [
   }
 ]
 
+parameters: [
+    {
+        key: "model_path"
+        value: {
+            string_value: "<path to wmt14.en-fr.joined-dict.transformer>"
+        }
+    }
+]
+
+
 instance_group [
     {
         count: 1

@@ -15,12 +15,30 @@ import argparse
 from torch.serialization import add_safe_globals
 
 
+import numpy as np
+import random
+import os
+
+# Ensure PyTorch uses deterministic algorithms
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+torch.use_deterministic_algorithms(True)
+
+seed = 0
+torch.manual_seed(seed)
+random.seed(seed)
+np.random.seed(seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(seed)
+
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # or ":16:8"
+
 class WrappedDecoder(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, model_path):
         super().__init__()
 
         model = TransformerModel.from_pretrained(
-            '<path to wmt14.en-fr.joined-dict.transformer>',
+            model_path,
             'model.pt'
         )
         device = 'cuda'
@@ -143,11 +161,10 @@ class WrappedDecoder(torch.nn.Module):
 class TritonPythonModel:
     def initialize(self, args):
         add_safe_globals([argparse.Namespace])
-        
-        self.wrapped_decoder = WrappedDecoder()
+        self.model_config = json.loads(args["model_config"])
+        model_path = self.model_config["parameters"]["model_path"]["string_value"]
 
-        # You must parse model_config. JSON string is not parsed here
-        self.model_config = model_config = json.loads(args["model_config"])
+        self.wrapped_decoder = WrappedDecoder(model_path)
 
     def execute(self, requests):
         responses = []
