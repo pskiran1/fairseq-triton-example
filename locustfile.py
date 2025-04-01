@@ -1,9 +1,14 @@
-from locust import HttpUser, task
-from locust.exception import LocustError
+from locust import HttpUser, task, events
+import json
 
 request_count = 0
 MAX_REQUESTS = 1
 wrong_outputs = 0
+
+@events.test_stop.add_listener
+def on_test_stop(environment, **kwargs):
+    global wrong_outputs
+    print(f"\n**************** Total wrong outputs: {wrong_outputs} ****************")
 
 class TritonTranslationUser(HttpUser):
     @task
@@ -28,40 +33,26 @@ class TritonTranslationUser(HttpUser):
             ]
         }
 
-        try:
-            response = self.client.post("/v2/models/bls/infer", json=body)
-
-            # Check HTTP status first
+        with self.client.post("/v2/models/bls/infer", json=body, catch_response=True) as response:
             if response.status_code != 200:
-                raise LocustError(
-                    f"Request failed: {response.status_code} - {response.text}"
-                )
-
-            # Attempt JSON parsing
-            try:
-                response_json = response.json()
-                expected_result = [134, 16, 65, 2]
-                if response_json["outputs"][0]["data"] != expected_result:
+                if response.status_code == 500:
                     wrong_outputs += 1
-                    print(
-                        "****************",
-                        wrong_outputs,
-                        "--",
-                        "Output mismatched: ",
-                        response_json["outputs"][0]["data"],
-                        " -",
-                        request_count,
-                    )
-                else:
-                    pass
-
-            except json.JSONDecodeError:
-                raise LocustError(f"Invalid JSON response: {response.text[:200]}")
-
-        except Exception as e:
-            print(f"Error during request: {str(e)}")
-
+                print(f"Status code {response.status_code} - request_count: {request_count} - {response.text}")
+                response.failure(f"Status code {response.status_code}")
+            else:
+                try:
+                    response_json = response.json()
+                    expected_result = [134, 16, 65, 2]
+                    if response_json["outputs"][0]["data"] != expected_result:
+                        wrong_outputs += 1
+                        print(f'**************** Output mismatched: {response_json["outputs"][0]["data"]} - wrong_outputs: {wrong_outputs} - request_count: {request_count} ****************')
+                        response.failure(f'**************** Output mismatched ****************')
+                except Exception as e:
+                    print(e)
+                    response.failure(e)
+        
         request_count += 1
+
         # print("########### request_count:", request_count, "#### wrong_outputs:", wrong_outputs, "#########")
         # if request_count >= MAX_REQUESTS:
         #    self.environment.runner.quit()
