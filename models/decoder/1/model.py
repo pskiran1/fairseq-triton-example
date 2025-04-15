@@ -15,24 +15,6 @@ import argparse
 from torch.serialization import add_safe_globals
 
 
-import numpy as np
-import random
-import os
-
-# Ensure PyTorch uses deterministic algorithms
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-torch.use_deterministic_algorithms(True)
-
-seed = 0
-torch.manual_seed(seed)
-random.seed(seed)
-np.random.seed(seed)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(seed)
-
-os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # or ":16:8"
-
 class WrappedDecoder(torch.nn.Module):
     def __init__(self, model_path):
         super().__init__()
@@ -160,11 +142,21 @@ class WrappedDecoder(torch.nn.Module):
 
 class TritonPythonModel:
     def initialize(self, args):
+        #instance_id = args.get("model_instance_name", "N/A")
+        #print(f"------------------ Instance ID: {instance_id}, Seed: {seed}, Deterministic settings applied in initialize()")
+
         add_safe_globals([argparse.Namespace])
         self.model_config = json.loads(args["model_config"])
         model_path = self.model_config["parameters"]["model_path"]["string_value"]
 
         self.wrapped_decoder = WrappedDecoder(model_path)
+
+        #self.compiled_decoder = torch.compile(
+        #    self.wrapped_decoder,
+        #    fullgraph=False,
+        #    dynamic=False,
+        #    backend="aot_eager"  # Changed backend to "aot_eager"
+        #)
 
     def execute(self, requests):
         responses = []
@@ -186,6 +178,7 @@ class TritonPythonModel:
             incremental_encoder_padding = torch.from_dlpack(input_5.to_dlpack()).to("cuda")
     
             # Run inference
+            #with torch.inference_mode(): # Added inference mode for triton as well
             logits, attn, self_kv, enc_kv, enc_masks = self.wrapped_decoder(
                 prev_output_tokens=prev_output_tokens,
                 encoder_out=encoder_out,
@@ -203,6 +196,7 @@ class TritonPythonModel:
                 pb_utils.Tensor.from_dlpack("OUTPUT__3", torch.to_dlpack(enc_kv)),
                 pb_utils.Tensor.from_dlpack("OUTPUT__4", torch.to_dlpack(enc_masks))
             ]
+            print("----- Decoder: prev_output_tokens:", prev_output_tokens, "OUTPUT__1:", attn)
             
             responses.append(pb_utils.InferenceResponse(output_tensors=out_tensors))
         return responses
