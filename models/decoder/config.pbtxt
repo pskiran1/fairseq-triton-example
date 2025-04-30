@@ -1,6 +1,5 @@
 name: "decoder"
-backend: "python"
-#platform: "pytorch_libtorch"
+platform: "pytorch_libtorch"
 max_batch_size: 80
 input [
   {
@@ -62,14 +61,6 @@ output [
   }
 ]
 
-parameters: [
-    {
-        key: "model_path"
-        value: {
-            string_value: "<path to wmt14.en-fr.joined-dict.transformer>"
-        }
-    }
-]
 
 
 instance_group [

@@ -100,23 +100,37 @@ def reorder_encoder_padding_mask(padding_mask: Tensor, new_order: Tensor) -> Ten
 class TritonEncoder(FairseqEncoder):
     def __init__(self):
         super().__init__(None)
+        self.encoder_client = grpcclient.InferenceServerClient("localhost:8001")
 
     def forward(self, src_tokens, src_lengths=None, **kwargs):
-        # Run using pb_utils.InferenceRequest
-        inference_request = pb_utils.InferenceRequest(
-            model_name='encoder',
-            requested_output_names=['OUTPUT__0', 'OUTPUT__1'],
-            inputs=[pb_utils.Tensor.from_dlpack('INPUT__0', to_dlpack(src_tokens)), pb_utils.Tensor.from_dlpack('INPUT__1', to_dlpack(src_lengths))]
-        )
-        inference_response = inference_request.exec()
+        
+        # Convert tensors to CPU numpy arrays
+        src_tokens_np = src_tokens.cpu().numpy().astype(np.int64)
+        src_lengths_np = src_lengths.cpu().numpy().astype(np.int64)
 
-        if inference_response.has_error():
-            raise pb_utils.TritonModelException(
-                inference_response.error().message()
-            )
+        # Prepare inputs
+        inputs = [
+            grpcclient.InferInput('INPUT__0', src_tokens_np.shape, 'INT64'),
+            grpcclient.InferInput('INPUT__1', src_lengths_np.shape, 'INT64'),
+        ]
+        inputs[0].set_data_from_numpy(src_tokens_np)
+        inputs[1].set_data_from_numpy(src_lengths_np)
 
-        encoder_out = get_torch_from_response(inference_response, 'OUTPUT__0')
-        encoder_padding_mask = get_torch_from_response(inference_response, 'OUTPUT__1').to(torch.bool)
+        # Get outputs
+        outputs = [
+            grpcclient.InferRequestedOutput('OUTPUT__0'),
+            grpcclient.InferRequestedOutput('OUTPUT__1'),
+        ]
+
+        # Perform inference
+        response = self.encoder_client.infer(model_name='encoder', inputs=inputs, outputs=outputs)
+
+        # Process outputs
+        encoder_out_np = response.as_numpy('OUTPUT__0')
+        encoder_padding_mask_np = response.as_numpy('OUTPUT__1')
+
+        encoder_out = torch.from_numpy(encoder_out_np.copy()).cuda()
+        encoder_padding_mask = torch.from_numpy(encoder_padding_mask_np.copy()).cuda().to(torch.bool)
         return {
             'encoder_out': [encoder_out.permute(1, 0, 2)],
             'encoder_padding_mask': [encoder_padding_mask],
@@ -126,49 +140,6 @@ class TritonEncoder(FairseqEncoder):
             'src_lengths': []
         }
 
-#class TritonEncoder(FairseqEncoder):
-#    def __init__(self):
-#        super().__init__(None)
-#        self.encoder_client = grpcclient.InferenceServerClient("localhost:8001")
-#
-#    def forward(self, src_tokens, src_lengths=None, **kwargs):
-#        
-#        # Convert tensors to CPU numpy arrays
-#        src_tokens_np = src_tokens.cpu().numpy().astype(np.int64)
-#        src_lengths_np = src_lengths.cpu().numpy().astype(np.int64)
-#
-#        # Prepare inputs
-#        inputs = [
-#            grpcclient.InferInput('INPUT__0', src_tokens_np.shape, 'INT64'),
-#            grpcclient.InferInput('INPUT__1', src_lengths_np.shape, 'INT64'),
-#        ]
-#        inputs[0].set_data_from_numpy(src_tokens_np)
-#        inputs[1].set_data_from_numpy(src_lengths_np)
-#
-#        # Get outputs
-#        outputs = [
-#            grpcclient.InferRequestedOutput('OUTPUT__0'),
-#            grpcclient.InferRequestedOutput('OUTPUT__1'),
-#        ]
-#
-#        # Perform inference
-#        response = self.encoder_client.infer(model_name='encoder', inputs=inputs, outputs=outputs)
-#
-#        # Process outputs
-#        encoder_out_np = response.as_numpy('OUTPUT__0')
-#        encoder_padding_mask_np = response.as_numpy('OUTPUT__1')
-#
-#        encoder_out = torch.from_numpy(encoder_out_np.copy()).cuda()
-#        encoder_padding_mask = torch.from_numpy(encoder_padding_mask_np.copy()).cuda().to(torch.bool)
-#        return {
-#            'encoder_out': [encoder_out.permute(1, 0, 2)],
-#            'encoder_padding_mask': [encoder_padding_mask],
-#            'encoder_embedding': [],
-#            'encoder_states': [],
-#            'src_tokens': [],
-#            'src_lengths': []
-#        }
-#
     def reorder_encoder_out(self, encoder_out: Dict[str, List[Tensor]], new_order):
         """
         Reorder encoder output according to *new_order*.
@@ -230,6 +201,7 @@ class TritonDecoder(FairseqIncrementalDecoder):
         self.encoder_attn_num_heads = 16
         self.encoder_attn_head_dim = 64
         self.num_decoder_layers = 6
+        self.decoder_client = grpcclient.InferenceServerClient("localhost:8001")
 
     def forward(self, prev_output_tokens, encoder_out=None, incremental_state={}, **kwargs):
         # Run using pb_utils.InferenceRequest
@@ -238,41 +210,50 @@ class TritonDecoder(FairseqIncrementalDecoder):
         incremental_state.setdefault('incremental_encoder_attn_states', torch.zeros((batch_size, 2, self.num_decoder_layers, self.encoder_attn_num_heads, 1, self.encoder_attn_head_dim), device='cuda').contiguous())
         incremental_state.setdefault('incremental_encoder_prev_padding_mask', torch.zeros((batch_size, self.num_decoder_layers, 1), device='cuda').contiguous())
 
+        # Prepare encoder outputs
         encoder_padding_mask = encoder_out['encoder_padding_mask'][0].to(torch.int64)
-        encoder_out = encoder_out['encoder_out'][0].swapaxes(0, 1).contiguous()
+        encoder_out_tensor = encoder_out['encoder_out'][0].swapaxes(0, 1).contiguous()
 
+        # Convert tensors to CPU numpy arrays with correct types
+        prev_output_tokens_np = prev_output_tokens.contiguous().cpu().numpy().astype(np.int64)
+        encoder_out_np = encoder_out_tensor.cpu().numpy().astype(np.float32)
+        encoder_padding_mask_np = encoder_padding_mask.cpu().numpy().astype(np.int64)
+        inc_self_attn_states = incremental_state['incremental_self_attn_states'].clone(memory_format=torch.contiguous_format)
+        inc_self_attn_states_np = inc_self_attn_states.cpu().numpy().astype(np.float32)
+        inc_encoder_attn_states_np = incremental_state['incremental_encoder_attn_states'].cpu().numpy().astype(np.float32)
+        inc_prev_padding_mask_np = incremental_state['incremental_encoder_prev_padding_mask'].cpu().numpy().astype(np.float32)
 
-        inference_request = pb_utils.InferenceRequest(
+        # Create InferInputs
+        inputs = [
+            grpcclient.InferInput('INPUT__0', prev_output_tokens_np.shape, 'INT64'),
+            grpcclient.InferInput('INPUT__1', encoder_out_np.shape, 'FP32'),
+            grpcclient.InferInput('INPUT__2', encoder_padding_mask_np.shape, 'INT64'),
+            grpcclient.InferInput('INPUT__3', inc_self_attn_states_np.shape, 'FP32'),
+            grpcclient.InferInput('INPUT__4', inc_encoder_attn_states_np.shape, 'FP32'),
+            grpcclient.InferInput('INPUT__5', inc_prev_padding_mask_np.shape, 'FP32'),
+        ]
+        inputs[0].set_data_from_numpy(prev_output_tokens_np)
+        inputs[1].set_data_from_numpy(encoder_out_np)
+        inputs[2].set_data_from_numpy(encoder_padding_mask_np)
+        inputs[3].set_data_from_numpy(inc_self_attn_states_np)
+        inputs[4].set_data_from_numpy(inc_encoder_attn_states_np)
+        inputs[5].set_data_from_numpy(inc_prev_padding_mask_np)
+
+        # Perform inference
+        response = self.decoder_client.infer(
             model_name='decoder',
-            requested_output_names=['OUTPUT__0', 'OUTPUT__1', 'OUTPUT__2', 'OUTPUT__3', 'OUTPUT__4'],
-            inputs=[
-                pb_utils.Tensor.from_dlpack('INPUT__0', to_dlpack(prev_output_tokens.contiguous())),
-                pb_utils.Tensor.from_dlpack('INPUT__1', to_dlpack(encoder_out)),
-                pb_utils.Tensor.from_dlpack('INPUT__2', to_dlpack(encoder_padding_mask)),
-                pb_utils.Tensor.from_dlpack('INPUT__3', to_dlpack(incremental_state['incremental_self_attn_states'].clone(memory_format=torch.contiguous_format))),
-                pb_utils.Tensor.from_dlpack('INPUT__4', to_dlpack(incremental_state['incremental_encoder_attn_states'])),
-                pb_utils.Tensor.from_dlpack('INPUT__5', to_dlpack(incremental_state['incremental_encoder_prev_padding_mask']))
-            ]
+            inputs=inputs,
+            outputs=[grpcclient.InferRequestedOutput(name) for name in ['OUTPUT__0', 'OUTPUT__1', 'OUTPUT__2', 'OUTPUT__3', 'OUTPUT__4']]
         )
-        inference_response = inference_request.exec()
 
-        if inference_response.has_error():
-            raise pb_utils.TritonModelException(
-                inference_response.error().message()
-            )
+        # Process outputs
+        logits = torch.from_numpy(response.as_numpy('OUTPUT__0').copy()).cuda()
+        attn = torch.from_numpy(response.as_numpy('OUTPUT__1').copy()).cuda()
+        prev_self_kv = torch.from_numpy(response.as_numpy('OUTPUT__2').copy()).cuda()
+        prev_encoder_kv = torch.from_numpy(response.as_numpy('OUTPUT__3').copy()).cuda()
+        prev_padding_mask = torch.from_numpy(response.as_numpy('OUTPUT__4').copy()).cuda()
 
-        logits = get_torch_from_response(inference_response, 'OUTPUT__0')
-        attn = get_torch_from_response(inference_response, 'OUTPUT__1')
-        prev_self_kv = get_torch_from_response(inference_response, 'OUTPUT__2')
-        prev_encoder_kv = get_torch_from_response(inference_response, 'OUTPUT__3')
-        prev_padding_mask = get_torch_from_response(inference_response, 'OUTPUT__4')
-
-        #print("-------------------------------------")
-        #print("**  Decoder **")
-        #print("prev_output_tokens:", prev_output_tokens, "- OUTPUT__1:", get_torch_from_response(inference_response, 'OUTPUT__1'))
-        ##print("OUTPUT__4:", get_torch_from_response(inference_response, 'OUTPUT__4'))
-        #print("-------------------------------------")
-
+        # Update incremental states
         if prev_output_tokens.shape[1] == 1:
             incremental_state['incremental_self_attn_states'] = prev_self_kv
         else:
@@ -280,75 +261,6 @@ class TritonDecoder(FairseqIncrementalDecoder):
         incremental_state['incremental_encoder_attn_states'] = prev_encoder_kv
         incremental_state['incremental_encoder_prev_padding_mask'] = prev_padding_mask
         return logits, attn
-#
-#class TritonDecoder(FairseqIncrementalDecoder):
-#    def __init__(self):
-#        super().__init__(None)
-#        self.self_attn_num_heads = 16
-#        self.self_attn_head_dim = 64
-#        self.encoder_attn_num_heads = 16
-#        self.encoder_attn_head_dim = 64
-#        self.num_decoder_layers = 6
-#        self.decoder_client = grpcclient.InferenceServerClient("localhost:8001")
-#
-#    def forward(self, prev_output_tokens, encoder_out=None, incremental_state={}, **kwargs):
-#        # Run using pb_utils.InferenceRequest
-#        batch_size = prev_output_tokens.size(0)
-#        incremental_state.setdefault('incremental_self_attn_states', torch.zeros((batch_size, 2, self.num_decoder_layers, self.self_attn_num_heads, 1, self.self_attn_head_dim), device='cuda').contiguous())
-#        incremental_state.setdefault('incremental_encoder_attn_states', torch.zeros((batch_size, 2, self.num_decoder_layers, self.encoder_attn_num_heads, 1, self.encoder_attn_head_dim), device='cuda').contiguous())
-#        incremental_state.setdefault('incremental_encoder_prev_padding_mask', torch.zeros((batch_size, self.num_decoder_layers, 1), device='cuda').contiguous())
-#
-#        # Prepare encoder outputs
-#        encoder_padding_mask = encoder_out['encoder_padding_mask'][0].to(torch.int64)
-#        encoder_out_tensor = encoder_out['encoder_out'][0].swapaxes(0, 1).contiguous()
-#
-#        # Convert tensors to CPU numpy arrays with correct types
-#        prev_output_tokens_np = prev_output_tokens.contiguous().cpu().numpy().astype(np.int64)
-#        encoder_out_np = encoder_out_tensor.cpu().numpy().astype(np.float32)
-#        encoder_padding_mask_np = encoder_padding_mask.cpu().numpy().astype(np.int64)
-#        inc_self_attn_states = incremental_state['incremental_self_attn_states'].clone(memory_format=torch.contiguous_format)
-#        inc_self_attn_states_np = inc_self_attn_states.cpu().numpy().astype(np.float32)
-#        inc_encoder_attn_states_np = incremental_state['incremental_encoder_attn_states'].cpu().numpy().astype(np.float32)
-#        inc_prev_padding_mask_np = incremental_state['incremental_encoder_prev_padding_mask'].cpu().numpy().astype(np.float32)
-#
-#        # Create InferInputs
-#        inputs = [
-#            grpcclient.InferInput('INPUT__0', prev_output_tokens_np.shape, 'INT64'),
-#            grpcclient.InferInput('INPUT__1', encoder_out_np.shape, 'FP32'),
-#            grpcclient.InferInput('INPUT__2', encoder_padding_mask_np.shape, 'INT64'),
-#            grpcclient.InferInput('INPUT__3', inc_self_attn_states_np.shape, 'FP32'),
-#            grpcclient.InferInput('INPUT__4', inc_encoder_attn_states_np.shape, 'FP32'),
-#            grpcclient.InferInput('INPUT__5', inc_prev_padding_mask_np.shape, 'FP32'),
-#        ]
-#        inputs[0].set_data_from_numpy(prev_output_tokens_np)
-#        inputs[1].set_data_from_numpy(encoder_out_np)
-#        inputs[2].set_data_from_numpy(encoder_padding_mask_np)
-#        inputs[3].set_data_from_numpy(inc_self_attn_states_np)
-#        inputs[4].set_data_from_numpy(inc_encoder_attn_states_np)
-#        inputs[5].set_data_from_numpy(inc_prev_padding_mask_np)
-#
-#        # Perform inference
-#        response = self.decoder_client.infer(
-#            model_name='decoder',
-#            inputs=inputs,
-#            outputs=[grpcclient.InferRequestedOutput(name) for name in ['OUTPUT__0', 'OUTPUT__1', 'OUTPUT__2', 'OUTPUT__3', 'OUTPUT__4']]
-#        )
-#
-#        # Process outputs
-#        logits = torch.from_numpy(response.as_numpy('OUTPUT__0').copy()).cuda()
-#        attn = torch.from_numpy(response.as_numpy('OUTPUT__1').copy()).cuda()
-#        prev_self_kv = torch.from_numpy(response.as_numpy('OUTPUT__2').copy()).cuda()
-#        prev_encoder_kv = torch.from_numpy(response.as_numpy('OUTPUT__3').copy()).cuda()
-#        prev_padding_mask = torch.from_numpy(response.as_numpy('OUTPUT__4').copy()).cuda()
-#
-#        # Update incremental states
-#        if prev_output_tokens.shape[1] == 1:
-#            incremental_state['incremental_self_attn_states'] = prev_self_kv
-#        else:
-#            incremental_state['incremental_self_attn_states'] = torch.cat([incremental_state['incremental_self_attn_states'], prev_self_kv], dim=4)
-#        incremental_state['incremental_encoder_attn_states'] = prev_encoder_kv
-#        incremental_state['incremental_encoder_prev_padding_mask'] = prev_padding_mask
-#        return logits, attn
 
     def reorder_incremental_state(
             self,
